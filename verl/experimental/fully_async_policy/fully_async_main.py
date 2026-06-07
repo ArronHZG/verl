@@ -19,7 +19,6 @@ Supports two data transfer backends (selected via config.transfer_queue.enable):
 - transfer_queue.enable=True:  TransferQueue + ReplayBuffer + TQFullyAsyncRollouter/TQFullyAsyncTrainer
 """
 
-import asyncio
 import os
 import socket
 import threading
