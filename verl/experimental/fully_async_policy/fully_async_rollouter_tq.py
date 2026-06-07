@@ -37,7 +37,7 @@ from verl.utils.profiler import marked_timer
 try:
     import transfer_queue as tq
 except ImportError:
-    print("Please install TQ by calling `pip install TransferQueue==0.1.6` and try again.")
+    print("Please install TQ by calling `pip install TransferQueue==0.1.8` and try again.")
     from verl.utils.transferqueue_utils import tq
 
 logger = logging.getLogger(__name__)

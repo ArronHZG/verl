@@ -296,16 +296,6 @@ class FullyAsyncTaskRunner:
                 ray.cancel(future)
             raise
         finally:
-            # Cleanup based on mode
-            if self._use_tq:
-                rb = self.components.get("replay_buffer")
-                if rb is not None:
-                    try:
-                        ray.get(rb.signal_finish.remote())
-                    except Exception:
-                        pass
-            else:
-                asyncio.run(self.components["message_queue_client"].clear_queue())
             print("[ASYNC MAIN] Training completed or interrupted")
 
 

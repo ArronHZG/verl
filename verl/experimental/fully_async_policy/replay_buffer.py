@@ -52,7 +52,7 @@ import ray
 try:
     import transfer_queue as tq
 except ImportError:
-    print("Please install TQ by calling `pip install TransferQueue==0.1.6` and try again.")
+    print("Please install TQ by calling `pip install TransferQueue==0.1.8` and try again.")
     from verl.utils.transferqueue_utils import tq
 
 from verl.experimental.fully_async_policy.detach_utils import safe_create_task
@@ -143,7 +143,7 @@ class ReplayBuffer:
             corrupting the uid→response_keys mapping used by wait_and_sample().
         """
         try:
-            while not self._finished:
+            while True:
                 data = tq.kv_list()
                 if data is not None:
                     # Build a fresh snapshot from TQ, then atomically replace self.partitions
@@ -276,15 +276,36 @@ class ReplayBuffer:
            from the partition — integrity check: skip uids whose response keys haven't been
            fully synced by _poll_from_tq yet (race between uid "finished" and response key arrival)
         4. Return all collected response keys for up to sample_size *complete* uids
+
+        Returns:
+            list of (key, meta) tuples when enough samples are available, or
+            None when _finished is True and no more samples will be produced (termination signal)
         """
         async with self._data_available:
             while True:
-                # Check termination first
+                # Check termination first: refresh TQ snapshot to get latest state
                 if self._finished:
-                    return None
+                    data = tq.kv_list()
+                    if data is not None:
+                        # Build a fresh snapshot from TQ, then atomically replace self.partitions
+                        new_partitions: dict[str, dict[str, dict]] = defaultdict(dict)
+                        for pid, items in data.items():
+                            for key, meta in items.items():
+                                new_partitions[pid][key] = meta
+                        # Update self.partitions atomically
+                        self.partitions = new_partitions
 
                 # Check if enough finish samples (uids) are ready
                 part = self.partitions.get(partition_id)
+
+                # Termination check: if _finished and no data available, return None to signal trainer to stop
+                if self._finished and (part is None or len(part) == 0):
+                    print(
+                        f"[ReplayBuffer][sample][{partition_id}] _finished=True, no data remaining, returning None (termination)",
+                        flush=True,
+                    )
+                    return None
+
                 if part is not None:
                     # Step 1: Find finished uids from uid-level keys with status 'finished'
                     finished_uids: set[str] = set()
@@ -377,6 +398,8 @@ class ReplayBuffer:
                             f"[ReplayBuffer][wait_and_sample][{partition_id}] ready: "
                             f"{len(finished_uids)} uids, need={sample_size}",
                         )
+                        if self._finished:
+                            return None
 
                 # Wait for _poll_from_tq to write new metadata or signal_finish
                 await self._data_available.wait()
