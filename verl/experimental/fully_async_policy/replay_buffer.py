@@ -17,27 +17,29 @@
 Architecture:
 - TQFullyAsyncRollouter: Calls acquire_slot() in _feed_samples, writes results to TQ with status=finish,
   then calls release_slot() to release the slot after successful TQ write
-- TQFullyAsyncTrainer: Consumes finished samples via wait_and_sample(), reads data from TQ
+- TQFullyAsyncTrainer: Consumes finished samples via sample(), reads data from TQ
 
 Status Flow:
     (Rollouter writes status=finish) -> finish -> (Trainer consumes & removes)
 
-Slot Control:
-- acquire_slot(): Rollouter calls in _feed_samples BEFORE putting to pending_queue (blocking)
-- release_slot(): Called by Rollouter after successfully writing sample to TQ (normal path),
-  or on error/drop path (sample never written to TQ)
-- This replaces _should_pause_generation() + MessageQueue.queue_size backpressure
+Slot Control (Dual-Layer):
+    Layer 1 (Physical):  acquire_slot() / release_slot()
+        Limits simultaneous in-flight samples to prevent OOM/GPU overload.
+        Maps to max_concurrent_samples (e.g. TP * PP * 16).
+    Layer 2 (Version):  acquire_slot() blocks / reset_staleness() unblocks
+        Limits total slots per model version to control staleness.
+        Maps to required_samples * trigger_parameter_sync_step.
 
 Usage:
-    from verl.experimental.fully_async_policy_tq.replay_buffer import ReplayBuffer
+    from verl.experimental.fully_async_policy.replay_buffer import ReplayBuffer
 
-    rb = ReplayBuffer.remote(max_pending_slots=256)
+    rb = ReplayBuffer.remote(max_pending_slots=256, max_version_slots=2176)
     # Rollouter side:
     acquired = await asyncio.wrap_future(rb.acquire_slot.remote(timeout=None).future())
     # ... write to TQ ...
     await rb.release_slot.remote()  # release after successful TQ write
     # Trainer side:
-    sampled = await asyncio.wrap_future(rb.wait_and_sample.remote("train", batch_size=64).future())
+    sampled = await rb.sample.remote(partition_id="train", sample_size=32)
 """
 
 import asyncio
@@ -61,196 +63,134 @@ logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 
+_DEFAULT_MONITOR_INTERVAL_S = 60.0
+
+
 @ray.remote(max_concurrency=100)
 class ReplayBuffer:
-    """Ray Actor: metadata channel + slot-based flow control for TQ fully async training.
+    """Ray Actor: metadata channel + dual-layer slot-based flow control for TQ fully async training.
 
     Replaces MessageQueue (data channel) in the original fully_async_policy.
+
     Key responsibilities:
-    1. Slot-based backpressure: acquire_slot() blocks rollouter at dataloader source
-    2. Metadata storage: tracks status of each sample (updated by caller via update_metadata)
-    3. Consumer interface: wait_and_sample() for trainer to get finished samples
-    4. Version tracking: reset_staleness() for parameter sync coordination
+      1. **Slot-based backpressure** – ``acquire_slot()`` blocks rollouter at dataloader source
+      2. **Metadata storage** – tracks status of each sample (synced from TQ via background poll)
+      3. **Consumer interface** – ``sample()`` for trainer to get finished samples
+      4. **Version tracking** – ``reset_staleness()`` for parameter sync coordination
     """
+
+    # ------------------------------------------------------------------
+    # Construction & lifecycle
+    # ------------------------------------------------------------------
 
     def __init__(
         self,
         max_version_slots: int,
         max_pending_slots: int = 256,
         poll_interval: float = 1.0,
-    ):
-        # Partition -> {key: tags_dict}
-        self.idle_start_time = time.time()
-        self.step_start_time = time.time()
+    ) -> None:
+        # --- Timing ---
+        self.idle_start_time: float = time.time()
+        self.step_start_time: float = time.time()
 
+        # --- Metadata store ---
         self.partitions: dict[str, dict[str, dict]] = defaultdict(dict)
         self.poll_interval = poll_interval
-        self._finished = False
+        self._finished: bool = False
 
-        # ======== Layer 1: Physical slot control (concurrency / OOM guard) ========
-        # Limits simultaneous in-flight samples.
-        # Acquired in _feed_samples (Rollouter), released by release_slot() after TQ write.
-        # Maps to: max_concurrent_samples (e.g. TP * PP * 16)
-        self.max_pending_slots = max_pending_slots
-        self._pending_slots = 0  # acquired but not yet finish
-        # Condition for slot flow control: acquire_slot waits, release_slot/reset_staleness/signal_finish notify
-        self._slot_available = asyncio.Condition()
-        # Condition for data availability: wait_and_sample waits, _poll_from_tq/signal_finish notify
-        self._data_available = asyncio.Condition()
+        # --- Layer 1: Physical slot control (concurrency / OOM guard) ---
+        self.max_pending_slots: int = max_pending_slots
+        self._pending_slots: int = 0
 
-        # ======== Layer 2: Version window control (staleness guard) ========
-        # Limits total samples (slots) per model version.
-        # When _version_slots >= max_version_slots, acquire_slot() blocks until
-        # reset_staleness() is called (after param sync).
-        # _version_slots is in SLOT granularity: 1 slot = 1 sample (prompt).
-        self.max_version_slots = max_version_slots
-        self._version_slots = 0  # cumulative slots issued in current version
+        # --- Layer 2: Version window control (staleness guard) ---
+        self.max_version_slots: int = max_version_slots
+        self._version_slots: int = 0
 
-        # Initialize TQ in this actor process so _poll_from_tq can call tq.kv_list()
-        try:
-            import transfer_queue as tq
+        # --- Condition for slot availability ---
+        self._slot_available: asyncio.Condition = asyncio.Condition()
 
-            tq.init()
-            print("[ReplayBuffer] TQ initialized in RB actor process", flush=True)
-        except Exception as e:
-            print(f"[ReplayBuffer] TQ init warning: {e}", flush=True)
+        # --- Condition for data availability ---
+        self._data_available: asyncio.Condition = asyncio.Condition()
+
+        # --- TQ init ---
+        self._init_tq()
+
+        # --- Background tasks ---
+        self._monitor_task = safe_create_task(self._monitor_loop(), name="monitor_task")
 
         print(
-            f"[ReplayBuffer] initialized with "
-            f"max_pending_slots={max_pending_slots}, "
-            f"max_version_slots={max_version_slots}, "
-            f"poll_interval={poll_interval}"
+            f"[ReplayBuffer] initialized  max_pending={max_pending_slots}, max_version={max_version_slots}, ",
+            flush=True,
         )
+        print("[ReplayBuffer] Background monitor task started", flush=True)
 
-        # Start background tasks immediately
-        self._poll_task = safe_create_task(self._poll_from_tq(), name="poll_tq_task")
-        self._monitor_task = safe_create_task(self._monitor_loop(), name="monitor_task")
-        print("[ReplayBuffer] Background poll & monitor tasks started (asyncio)", flush=True)
-
-    async def _poll_from_tq(self):
-        """Background asyncio task that polls TQ for metadata updates.
-
-        Each poll replaces self.partitions with a fresh TQ snapshot (not in-place mutation).
-        This ensures self.partitions is always consistent with TQ's current state,
-        avoiding stale/corrupted data from incremental merge + concurrent remove().
-
-        UID integrity check:
-            When TQ deletion errors occur, orphaned keys may remain whose meta.uid
-            does not match the key's prefix. For example:
-            - Normal:   key='sample_1_13247_10_0', meta.uid='sample_1_13247'  → key starts with uid ✓
-            - Orphaned: key='sample_1_10885_13_0', meta.uid='sample_1_11114' → key does NOT start with uid ✗
-            Such entries are detected, logged as ABNORMAL, and deleted from TQ to prevent
-            corrupting the uid→response_keys mapping used by wait_and_sample().
-        """
-        try:
-            while True:
-                data = tq.kv_list()
-                if data is not None:
-                    # Build a fresh snapshot from TQ, then atomically replace self.partitions
-                    new_partitions: dict[str, dict[str, dict]] = defaultdict(dict)
-                    for partition_id, items in data.items():
-                        for key, meta in items.items():
-                            new_partitions[partition_id][key] = meta
-                    # Update self.partitions atomically
-                    async with self._data_available:
-                        self.partitions = new_partitions
-                        self._data_available.notify_all()
-                await asyncio.sleep(self.poll_interval)
-        except Exception as e:
-            print(f"[ReplayBuffer] _poll_from_tq error: {e}", flush=True)
-            import traceback
-
-            traceback.print_exc()
-            os._exit(1)
-
-    async def _monitor_loop(self):
-        """Background asyncio task that periodically logs buffer statistics."""
-
-        monitor_interval = 60.0
-        while not self._finished:
-            await asyncio.sleep(monitor_interval)
-            if self._finished:
-                break
+    async def _monitor_loop(self) -> None:
+        """Background task: periodically log buffer statistics."""
+        while True:
             try:
                 stats = await self.get_statistics()
                 print(f"[ReplayBuffer][Monitor] {pformat(stats)}")
-            except Exception as e:
-                logger.error(f"[ReplayBuffer] _monitor_loop error: {e}")
+                await asyncio.sleep(_DEFAULT_MONITOR_INTERVAL_S)
+            except Exception as exc:
+                logger.error("[ReplayBuffer] _monitor_loop error: %s", exc)
 
-    # ======== Public API ========
-
-    async def acquire_slot(self, timeout: float | None = None, uid="") -> bool:
+    async def acquire_slot(self, timeout: float | None = None, uid: str = "") -> bool:
         """Acquire a slot before processing a dataloader sample.
 
-        Layer 1 (Physical): ``_pending_slots < max_pending_slots``
-            Limits simultaneous in-flight samples to prevent OOM / GPU overload.
-            Slot is released by calling release_slot() after writing to TQ.
+        Both layer conditions must hold:
 
-        Layer 2 (Version window): ``_version_slots < max_version_slots``
-            Limits total slots issued per model version to control staleness.
-            When the version window is full, acquire_slot() blocks until
-            reset_staleness() is called after parameter synchronization.
-            Only enforced if max_version_slots is set (via set_version_config()).
+        - **Layer 1 (Physical)**: ``_pending_slots < max_pending_slots``
+          Prevents OOM / GPU overload from too many in-flight samples.
+        - **Layer 2 (Version)**: ``_version_slots < max_version_slots``
+          Controls staleness; blocks until ``reset_staleness()`` after param sync.
 
-        Both conditions must be satisfied for a slot to be issued.
+        Returns ``True`` if acquired, ``False`` if timed out or ``_finished``.
         """
-        _wait_forever = timeout is None
-        _deadline_abs = None if _wait_forever else (asyncio.get_event_loop().time() + timeout)
+        wait_forever = timeout is None
+        deadline = None if wait_forever else asyncio.get_event_loop().time() + timeout
 
         async with self._slot_available:
-            while True:
-                # Check termination first
-                if self._finished:
-                    return False
-
-                # Layer 1: Physical concurrency limit
+            while not self._finished:
                 physical_ok = self._pending_slots < self.max_pending_slots
-
-                # Layer 2: Version window limit (staleness control)
-                version_ok = self.max_version_slots is None or self._version_slots < self.max_version_slots
+                version_ok = self._version_slots < self.max_version_slots
 
                 if physical_ok and version_ok:
                     self._pending_slots += 1
                     self._version_slots += 1
                     logger.debug(
-                        f"[ReplayBuffer][acquire_slot] Acquiring slot, "
-                        f"pending_slots={self._pending_slots}, "
-                        f"version_slots={self._version_slots}, "
-                        f"uid={uid}"
+                        "[acquire_slot] ok  pending=%d  version=%d  uid=%s",
+                        self._pending_slots,
+                        self._version_slots,
+                        uid,
                     )
                     return True
 
-                # Wait for notification (slot release, reset_staleness, or signal_finish)
-                if not _wait_forever:
-                    remaining = _deadline_abs - asyncio.get_event_loop().time()
+                # Block until slot released, staleness reset, or signal_finish
+                if not wait_forever:
+                    remaining = deadline - asyncio.get_event_loop().time()
                     if remaining <= 0:
                         return False
                     try:
-                        await asyncio.wait_for(
-                            self._slot_available.wait(),
-                            timeout=remaining,
-                        )
+                        await asyncio.wait_for(self._slot_available.wait(), timeout=remaining)
                     except TimeoutError:
                         return False
                 else:
                     await self._slot_available.wait()
+            return False
 
-    async def release_slot(self):
-        """Release a slot after processing.
+    async def release_slot(self) -> None:
+        """Release a slot after processing (success or failure).
 
-        When all slots are released (_pending_slots == 0), record the idle start time.
-        This means the rollouter has finished all in-flight work but may be blocked
-        from acquiring new slots (e.g., version window full, dataloader exhausted).
-        Mirrors fully_async_rollouter.py:886 idle tracking.
+        When all slots are released (``_pending_slots == 0``), records
+        ``idle_start_time`` so ``reset_staleness()`` can compute idle ratio.
         """
         async with self._slot_available:
             self._pending_slots = max(0, self._pending_slots - 1)
             logger.debug(
-                f"[ReplayBuffer][release_slot] Releasing slot, "
-                f"pending_slots={self._pending_slots}, "
-                f"version_slots={self._version_slots}"
+                "[release_slot]  pending=%d  version=%d",
+                self._pending_slots,
+                self._version_slots,
             )
-            # Record idle start when all slots are released (rollouter has no work)
             if self._pending_slots == 0:
                 self.idle_start_time = time.time()
             self._slot_available.notify_all()
@@ -259,258 +199,107 @@ class ReplayBuffer:
         self,
         partition_id: str,
         sample_size: int,
-        rollout_n: int,
     ) -> list[tuple[str, dict]] | None:
-        """Block until enough finish samples (uids) are ready or production is fully complete.
+        """Block until *sample_size* complete UIDs are ready, or return ``None`` on termination.
 
         Args:
-            partition_id: Partition to sample from (e.g. 'train').
-            sample_size: Number of **samples (uids)** to wait for, not number of response keys.
-                        Each sample/uid may have multiple response keys (e.g. n=16 responses per prompt).
-            rollout_n: Number of response keys per uid (e.g. n=16 responses per prompt).
-
-        Strategy:
-        1. Find uid-level keys with status 'finished' (written by _run_prompt after all n responses done)
-        2. Extract uids from these uid-level keys
-        3. For each uid, find ALL matching response keys (e.g. 'sample_0_190_0', ..., 'sample_0_190_15')
-           from the partition — integrity check: skip uids whose response keys haven't been
-           fully synced by _poll_from_tq yet (race between uid "finished" and response key arrival)
-        4. Return all collected response keys for up to sample_size *complete* uids
+            partition_id: Partition to consume (e.g. ``'train'``, ``'val'``).
+            sample_size:   Number of **UIDs** (not response keys) to collect.
 
         Returns:
-            list of (key, meta) tuples when enough samples are available, or
-            None when _finished is True and no more samples will be produced (termination signal)
+            A list of ``(key, meta)`` tuples for the selected response keys, or
+            ``None`` when ``_finished`` is True and no more data will arrive.
         """
         async with self._data_available:
             while True:
-                # Check termination first: refresh TQ snapshot to get latest state
-                if self._finished:
-                    data = tq.kv_list()
-                    if data is not None:
-                        # Build a fresh snapshot from TQ, then atomically replace self.partitions
-                        new_partitions: dict[str, dict[str, dict]] = defaultdict(dict)
-                        for pid, items in data.items():
-                            for key, meta in items.items():
-                                new_partitions[pid][key] = meta
-                        # Update self.partitions atomically
-                        self.partitions = new_partitions
+                # Always pull fresh TQ snapshot — we are the sole reader of TQ metadata.
+                # No background poll task; this loop IS the sync point.
+                self._refresh_partitions_from_tq()
 
-                # Check if enough finish samples (uids) are ready
+                # Early exit: finished + empty → signal trainer to stop
                 part = self.partitions.get(partition_id)
+                result = self._try_sample_partition(part, partition_id, sample_size)
 
-                # Termination check: if _finished and no data available, return None to signal trainer to stop
-                if self._finished and (part is None or len(part) == 0):
-                    print(
-                        f"[ReplayBuffer][sample][{partition_id}] _finished=True, no data remaining, returning None (termination)",
-                        flush=True,
-                    )
+                if result is not None:
+                    return result
+
+                # Not enough data yet — check termination before waiting
+                if self._finished:
                     return None
 
-                if part is not None:
-                    # Step 1: Find finished uids from uid-level keys with status 'finished'
-                    finished_uids: set[str] = set()
-                    for key, meta in part.items():
-                        status = meta.get("status", "")
-                        if status == "finished":
-                            finished_uids.add(key)
-
-                    # Step 2: Check if we have enough finished uids
-                    if len(finished_uids) >= sample_size:
-                        # Step 3: Count response keys per uid (integrity check)
-                        # Build uid -> [response_keys] mapping from ALL non-uid-level entries
-                        uid_response_keys: dict[str, list[tuple[str, dict]]] = {}
-                        for key, meta in part.items():
-                            uid = meta.get("uid", "")
-                            if uid and uid in finished_uids:
-                                # This is a response key (has uid tag) belonging to a finished uid
-                                uid_response_keys.setdefault(uid, []).append((key, meta))
-
-                        normal_eq_uids = [uid for uid, keys in uid_response_keys.items() if len(keys) == rollout_n]
-                        abnormal_gt_uids = [uid for uid, keys in uid_response_keys.items() if len(keys) > rollout_n]
-                        abnormal_lt_uids = [uid for uid, keys in uid_response_keys.items() if len(keys) < rollout_n]
-
-                        # For abnormal_gt_uids: check key vs meta.uid consistency,
-                        # remove mismatched keys from in-memory partition (not TQ),
-                        # then promote to normal_eq_uids if remaining count == rollout_n
-                        if abnormal_gt_uids:
-                            promoted_uids: list[str] = []
-                            detail_lines: list[str] = []
-                            for uid in abnormal_gt_uids:
-                                keys_and_metas = uid_response_keys[uid]
-                                matched_keys: list[tuple[str, dict]] = []
-                                removed_keys: list[str] = []
-                                for key, meta in keys_and_metas:
-                                    meta_uid = meta.get("uid", "") if isinstance(meta, dict) else ""
-                                    if meta_uid and key.startswith(meta_uid):
-                                        matched_keys.append((key, meta))
-                                    else:
-                                        part.pop(key, None)
-                                        removed_keys.append(key)
-
-                                if matched_keys and len(matched_keys) == rollout_n:
-                                    promoted_uids.append(uid)
-                                    uid_response_keys[uid] = matched_keys
-                                    detail_lines.append(
-                                        f"  uid='{uid}': {len(keys_and_metas)}->{len(matched_keys)} keys, "
-                                        f"removed={removed_keys}"
-                                    )
-
-                            if detail_lines:
-                                print(
-                                    f"[ReplayBuffer][sample] ✂️ Cleaned {len(abnormal_gt_uids)} abnormal_gt uids "
-                                    f"(promoted {len(promoted_uids)} to normal_eq, "
-                                    f"remaining abnormal={len(abnormal_gt_uids) - len(promoted_uids)})\n"
-                                    + "\n".join(detail_lines),
-                                    flush=True,
-                                )
-
-                            normal_eq_uids.extend(promoted_uids)
-                            abnormal_gt_uids = [u for u in abnormal_gt_uids if u not in set(promoted_uids)]
-
-                        if len(normal_eq_uids) >= sample_size:
-                            selected_uids = normal_eq_uids[:sample_size]
-                            all_response_keys: list[tuple[str, dict]] = []
-                            for uid in selected_uids:
-                                all_response_keys.extend(uid_response_keys[uid])
-
-                            expected_keys = sample_size * rollout_n
-
-                            if len(all_response_keys) != expected_keys:
-                                print(
-                                    f"len(all_response_keys)={len(all_response_keys)} != expected_keys={expected_keys}"
-                                )
-                                continue
-
-                            print(
-                                f"[ReplayBuffer][wait_and_sample][{partition_id}] Returning {len(all_response_keys)} "
-                                f"response keys from {len(selected_uids)} uids "
-                                f"(sample_size={sample_size}, "
-                                f"total_finished={len(finished_uids)}, "
-                                f"normal_eq_uids={len(normal_eq_uids)}, "
-                                f"abnormal_gt_uids={len(abnormal_gt_uids)}, "
-                                f"abnormal_lt_uids={len(abnormal_lt_uids)})",
-                                flush=True,
-                            )
-
-                            return all_response_keys
-                    else:
-                        print(
-                            f"[ReplayBuffer][wait_and_sample][{partition_id}] ready: "
-                            f"{len(finished_uids)} uids, need={sample_size}",
-                        )
-                        if self._finished:
-                            return None
-
-                # Wait for _poll_from_tq to write new metadata or signal_finish
-                await self._data_available.wait()
-
-    async def remove(self, partition_id: str, keys: list[str]):
-        """Remove consumed samples from the metadata store."""
-        async with self._data_available:
-            part = self.partitions.get(partition_id)
-            size_before = len(part) if part is not None else 0
-            if part is not None:
-                for key in keys:
-                    part.pop(key, None)
-            size_after = len(part) if part is not None else 0
-
-        logger.debug(
-            f"[ReplayBuffer][remove] partition={partition_id}: "
-            f"size {size_before} -> {size_after} "
-            f"(removed {len(keys)} keys, actually_deleted={size_before - size_after})",
-        )
+                await asyncio.sleep(self.poll_interval)
 
     async def reset_staleness(self) -> dict:
         """Reset the version window after parameter synchronization.
 
-        Mirrors FullyAsyncRollouter.reset_staleness() timing logic:
-        - version_time: wall-clock time since last reset (i.e., this param sync cycle duration)
-        - active_time: actual work time within the cycle (version_time minus idle periods)
-        - idle_ratio: fraction of time the rollouter was idle during the cycle
+        Computes timing metrics (active_time, version_time, idle_ratio) that
+        mirror ``FullyAsyncRollouter.reset_staleness()``, then wakes up any
+        ``acquire_slot()`` callers blocked on the version window.
         """
         async with self._slot_available:
-            # Compute current partition status counts for state reset
             partition_stats = await self.compute_partition_stats()
             prev_version_slots = self._version_slots
 
             data = tq.kv_list()
             tq_keys = sum(len(items) for items in data.values()) if data else 0
 
-            # Use partition_stats["train"]["success"] as the unconsumed backlog count
-            # This reflects samples written to TQ (status=success) but not yet consumed by trainer
             train_stats = partition_stats.get("train", {})
             train_finished_slots = train_stats.get("finished", 0)
 
-            # _version_slots = pending_slots (in-flight) + success_backlog (unconsumed in partitions)
-            # Uses partition_stats which is the source of truth for what trainer has not yet consumed
+            # Recompute version slots: in-flight + unconsumed backlog
             self._version_slots = self._pending_slots + train_finished_slots
 
             # Timing metrics
-            # |step_start_time          |idle_start_time
-            #
-            # |<----- active_time ----->|<------ idle time ------>|
-            # |<------------- version_time ---------------------->|
-            now = time.time()
-            if self.step_start_time is None:
-                self.step_start_time = now
-                self.idle_start_time = now
-
-            rollout_version_time = max(now - self.step_start_time, 1e-6)
-            if self.idle_start_time is not None and self.idle_start_time > self.step_start_time:
-                rollout_active_time = self.idle_start_time - self.step_start_time
-                idle_ratio = 1.0 - rollout_active_time / rollout_version_time
-            else:
-                rollout_active_time = rollout_version_time
-                idle_ratio = 0.0
-
-            timing_raw = {
-                "fully_async/rollouter/active_time": rollout_active_time,
-                "fully_async/rollouter/version_time": rollout_version_time,
-                "fully_async/rollouter/idle_ratio": idle_ratio,
-            }
+            timing = self._compute_timing_metrics()
 
             print(
                 f"[ReplayBuffer][reset_staleness] "
-                f"version_slots: {prev_version_slots} -> {self._version_slots} "
-                f"pending_slots={self._pending_slots}, "
-                f"train_finished_slots={train_finished_slots}, "
-                f"tq_keys={tq_keys}), "
-                f"idle_ratio: {idle_ratio:.4f}, ",
+                f"version_slots: {prev_version_slots} -> {self._version_slots}  "
+                f"pending={self._pending_slots}, "
+                f"train_finished={train_finished_slots}, "
+                f"tq_keys={tq_keys}, "
+                f"idle_ratio: {timing['fully_async/rollouter/idle_ratio']:.4f}, "
                 f"partition_stats: {partition_stats}",
                 flush=True,
             )
 
-            # Reset timers for next cycle (mirrors fully_async_rollouter.py:600)
+            # Reset timers for next cycle
+            now = time.time()
             self.step_start_time = now
             self.idle_start_time = now
 
-            # Wake up acquire_slot waiters blocked on version window
+            # Unblock acquire_slot waiters on version window
             self._slot_available.notify_all()
 
-        return timing_raw
+        return timing
 
-    async def signal_finish(self):
-        """Signal that production is fully complete — all samples are done."""
-        # Wake up acquire_slot waiters (return False)
+    async def signal_finish(self) -> None:
+        """Signal that production is fully complete — no more samples will arrive."""
+        self._finished = True
         async with self._slot_available:
-            self._finished = True
             self._slot_available.notify_all()
-        # Wake up wait_and_sample waiters (drain remaining)
         async with self._data_available:
             self._data_available.notify_all()
 
-    # ======== Statistics ========
-    async def compute_partition_stats(self) -> dict[str, dict[str, int]]:
-        """Compute per-partition status counts. Lock-free read.
+    # ------------------------------------------------------------------
+    # Statistics
+    # ------------------------------------------------------------------
 
-        Returns:
-            dict mapping partition_id -> {status_type: count, ...}
-            e.g. {"train": {"success": 64, "finished": 2}}
+    async def compute_partition_stats(self) -> dict[str, dict[str, int]]:
+        """Per-partition status counts (lock-free read).
+
+        Returns e.g. ``{"train": {"success": 64, "finished": 2}}``
         """
         async with self._data_available:
+            self._refresh_partitions_from_tq()
             partition_stats: dict[str, dict[str, int]] = {}
             for pid, part in self.partitions.items():
-                stats: dict[str, int] = {"success": 0, "finished": 0, "failure": 0, "unknown": 0}
+                stats: dict[str, int] = {
+                    "success": 0,
+                    "finished": 0,
+                    "failure": 0,
+                    "unknown": 0,
+                }
                 for v in part.values():
                     status = v.get("status", "unknown")
                     if status in stats:
@@ -519,17 +308,144 @@ class ReplayBuffer:
             return partition_stats
 
     async def get_statistics(self) -> dict:
-        """Return statistics about the buffer state. Lock-free read."""
+        """Full buffer-state snapshot (lock-free read)."""
         partition_stats = await self.compute_partition_stats()
-
         return {
             "partitions": partition_stats,
-            # Layer 1: Physical slot control
+            # Layer 1
             "pending_slots": self._pending_slots,
             "max_pending_slots": self.max_pending_slots,
             "available_physical_slots": max(0, self.max_pending_slots - self._pending_slots),
-            # Layer 2: Version window control
+            # Layer 2
             "version_slots": self._version_slots,
             "max_version_slots": self.max_version_slots,
-            "available_version_slots": max(0, (self.max_version_slots or 0) - self._version_slots),
+            "available_version_slots": max(0, self.max_version_slots - self._version_slots),
         }
+
+    # ==================================================================
+    # Private helpers  (pure logic, no I/O / locks)
+    # ==================================================================
+
+    # -- TQ snapshot -------------------------------------------------------
+
+    def _init_tq(self) -> None:
+        """Initialize TransferQueue in this actor process."""
+        try:
+            tq.init()
+            print("[ReplayBuffer] TQ initialized in RB actor process", flush=True)
+        except Exception as exc:
+            print(f"[ReplayBuffer] TQ init warning: {exc}", flush=True)
+
+    def _refresh_partitions_from_tq(self):
+        """Atomically replace ``self.partitions`` with a fresh TQ snapshot."""
+        data = tq.kv_list()
+        if data is None:
+            self.partitions = None
+        else:
+            new_partitions: dict[str, dict[str, dict]] = defaultdict(dict)
+            for pid, items in data.items():
+                for key, meta in items.items():
+                    new_partitions[pid][key] = meta
+            self.partitions = new_partitions
+
+    # -- Sample logic -----------------------------------------------------
+
+    def _try_sample_partition(
+        self,
+        part: dict[str, dict],
+        partition_id: str,
+        sample_size: int,
+    ) -> list[tuple[str, dict]] | None:
+        """Try to extract *sample_size* complete UIDs from *part*.
+
+        Returns the list of ``(key, meta)`` tuples on success, or ``None`` if
+        there aren't enough complete UIDs yet (caller should wait/retry).
+        """
+        if not part:
+            return None
+
+        finished_uids = list({key for key, meta in part.items() if meta.get("status") == "finished"})
+
+        if len(finished_uids) < sample_size:
+            print(
+                f"[ReplayBuffer][sample][{partition_id}] ready: {len(finished_uids)} uids, need={sample_size}",
+            )
+            return None
+
+        uid_response_keys = self._build_uid_response_key_map(part, finished_uids)
+
+        selected_uids = finished_uids[:sample_size]
+        all_response_keys: list[tuple[str, dict]] = []
+        for uid in selected_uids:
+            all_response_keys.extend(uid_response_keys[uid])
+
+        print(
+            f"[ReplayBuffer][sample][{partition_id}] Returning {len(all_response_keys)} keys "
+            f"from {len(selected_uids)} uids "
+            f"(sample_size={sample_size}, total_finished={len(finished_uids)}, ",
+            flush=True,
+        )
+
+        return all_response_keys
+
+    @staticmethod
+    def _build_uid_response_key_map(
+        part: dict[str, dict],
+        finished_uids: list[str],
+    ) -> dict[str, list[tuple[str, dict]]]:
+        """Map each finished UID → its response-key entries from *part*."""
+        mapping: dict[str, list[tuple[str, dict]]] = {}
+        for key, meta in part.items():
+            uid = meta.get("uid", "")
+            if uid and uid in finished_uids:
+                mapping.setdefault(uid, []).append((key, meta))
+        return mapping
+
+    # -- Timing -------------------------------------------------------------
+    def _compute_timing_metrics(self) -> dict[str, float]:
+        """Compute rollouter timing metrics for the just-completed version window.
+
+        |step_start_time          |idle_start_time          |
+        |<----- active_time ----->|<------ idle time ------>|
+        |<------------- version_time ---------------------->|
+        """
+
+        now = time.time()
+        if self.step_start_time is None:
+            self.step_start_time = now
+            self.idle_start_time = now
+
+        version_time = max(now - self.step_start_time, 1e-6)
+        if self.idle_start_time > self.step_start_time:
+            active_time = self.idle_start_time - self.step_start_time
+            idle_ratio = 1.0 - active_time / version_time
+        elif self.idle_start_time == self.step_start_time:
+            active_time = 0
+            idle_ratio = 1.0
+        else:
+            active_time = version_time
+            idle_ratio = 0.0
+
+        return {
+            "fully_async/rollouter/active_time": active_time,
+            "fully_async/rollouter/version_time": version_time,
+            "fully_async/rollouter/idle_ratio": idle_ratio,
+        }
+
+
+def tq_kv_clear(batch):
+    """Cleanup consumed batch from TQ and RB.
+
+    Two-phase cleanup:
+    1. Clear uid-level keys (deduplicated by uid from tags): removes uid status entries
+       like {'uid': {'status': 'finished'}} from both TQ and RB partitions.
+    2. Clear all sampled response keys: full cleanup of {uid}_{resp_idx} keys from TQ and RB.
+    """
+    uid_keys: set[str] = set()
+    for key, tag in zip(batch.keys, batch.tags, strict=False):
+        uid = tag.get("uid", "") if isinstance(tag, dict) else ""
+        if uid and uid not in uid_keys:
+            uid_keys.add(uid)
+
+    tq.kv_clear(keys=list(uid_keys), partition_id=batch.partition_id)
+    tq.kv_clear(keys=batch.keys, partition_id=batch.partition_id)

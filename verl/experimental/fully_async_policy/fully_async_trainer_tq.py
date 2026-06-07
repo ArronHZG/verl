@@ -37,6 +37,7 @@ from verl.experimental.fully_async_policy.fully_async_trainer import (
     FullyAsyncTrainer,
     TrainingStopException,
 )
+from verl.experimental.fully_async_policy.replay_buffer import tq_kv_clear
 from verl.single_controller.ray import RayWorkerGroup
 from verl.trainer.main_ppo_sync import PPOTrainer
 from verl.trainer.ppo.ray_trainer import ResourcePoolManager
@@ -168,12 +169,19 @@ class FullyAsyncTrainerTQ(PPOTrainer, FullyAsyncTrainer):
         sampled_keys_meta = await self.replay_buffer.sample.remote(
             partition_id="train",
             sample_size=self.required_samples,
-            rollout_n=self.config.actor_rollout_ref.rollout.n,
         )
 
         if sampled_keys_meta is None or len(sampled_keys_meta) == 0:
             print("[TQFullyAsyncTrainer] RB returned None (termination signal)")
             return None
+
+        rollout_n = self.config.actor_rollout_ref.rollout.n
+        expected = self.required_samples * rollout_n
+        if len(sampled_keys_meta) != expected:
+            # TODO: when multi-trajectory output support is added, this will need to change
+            raise ValueError(
+                f"[ReplayBuffer][sample] BUG: len(all_response_keys)={len(sampled_keys_meta)} != expected={expected}"
+            )
 
         keys = [k for k, _ in sampled_keys_meta]
         tags = [meta for _, meta in sampled_keys_meta]
@@ -237,11 +245,6 @@ class FullyAsyncTrainerTQ(PPOTrainer, FullyAsyncTrainer):
                 if batch is None:
                     raise TrainingStopException("Training terminated: RB returned None")
                 batch.extra_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
-            print(
-                f"[TQFullyAsyncTrainer] Waiting for {self.required_samples} samples, "
-                f"keys={len(batch)}, "
-                f"wait={timing_raw['gen']:.2f}s"
-            )
 
             # 3. [OPTIONAL] compute reward score with colocated reward model
             # TODO colocate reward not implemented
@@ -281,35 +284,13 @@ class FullyAsyncTrainerTQ(PPOTrainer, FullyAsyncTrainer):
             await self._fit_update_weights()
 
         await self._fit_collect_metrics(batch)
-        await self._cleanup_batch(batch)
+        tq_kv_clear(batch)
         await self._fit_reset_staleness()
 
         await self._fit_validate()
         self._fit_save_checkpoint()
         self._stop_profiling()
         self._fit_postprocess_step()
-
-    async def _cleanup_batch(self, batch):
-        """Cleanup consumed batch from TQ and RB.
-
-        Two-phase cleanup:
-        1. Clear uid-level keys (deduplicated by uid from tags): removes uid status entries
-           like {'uid': {'status': 'finished'}} from both TQ and RB partitions.
-        2. Clear all sampled response keys: full cleanup of {uid}_{resp_idx} keys from TQ and RB.
-        """
-        # Phase 1: Deduplicate by uid from tags to get uid-level keys
-        uid_keys: set[str] = set()
-        for key, tag in zip(batch.keys, batch.tags, strict=False):
-            uid = tag.get("uid", "") if isinstance(tag, dict) else ""
-            if uid and uid not in uid_keys:
-                uid_keys.add(uid)
-
-        tq.kv_clear(keys=list(uid_keys), partition_id=batch.partition_id)
-        await self.replay_buffer.remove.remote(batch.partition_id, list(uid_keys))
-
-        # Phase 2: Clear all sampled response keys (full cleanup)
-        tq.kv_clear(keys=batch.keys, partition_id=batch.partition_id)
-        await self.replay_buffer.remove.remote(batch.partition_id, batch.keys)
 
     async def _fit_update_weights(self):
         if self.local_trigger_step != 1:

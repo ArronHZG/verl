@@ -30,6 +30,7 @@ from verl.experimental.fully_async_policy.fully_async_rollouter import (
     FullyAsyncAgentLoopManager,
     FullyAsyncRollouter,
 )
+from verl.experimental.fully_async_policy.replay_buffer import tq_kv_clear
 from verl.trainer.main_ppo_sync import AgentLoopWorkerTQ
 from verl.utils import tensordict_utils as tu
 from verl.utils.profiler import marked_timer
@@ -300,9 +301,8 @@ class FullyAsyncRollouterTQ(FullyAsyncRollouter):
             self.async_rollout_manager.generate_sequences(batch)
 
             # 2. sample batch from replay buffer
-            sampled = await self.replay_buffer.sample.remote(
-                partition_id="val", sample_size=len(batch), rollout_n=self.config.actor_rollout_ref.rollout.val_kwargs.n
-            )
+            sampled = await self.replay_buffer.sample.remote(partition_id="val", sample_size=len(batch))
+
             # Unpack list[tuple[str, dict]] into KVBatchMeta format
             from verl.utils.transferqueue_utils import KVBatchMeta
 
@@ -410,7 +410,7 @@ class FullyAsyncRollouterTQ(FullyAsyncRollouter):
             dump_all_keys.extend(batch.keys)
 
             # 5. cleanup transfer queue and replay buffer
-            await self._cleanup_batch(batch)
+            tq_kv_clear(batch)
 
         # logger to wandb
         self._maybe_log_val_generations(inputs=sample_inputs, outputs=sample_outputs, scores=sample_scores)
@@ -449,28 +449,6 @@ class FullyAsyncRollouterTQ(FullyAsyncRollouter):
             )
 
         return self._val_metrics_update(data_sources, sample_uids, reward_extra_infos_dict, sample_turns)
-
-    async def _cleanup_batch(self, batch):
-        """Cleanup consumed batch from TQ and RB.
-
-        Two-phase cleanup:
-        1. Clear uid-level keys (deduplicated by uid from tags): removes uid status entries
-           like {'uid': {'status': 'finished'}} from both TQ and RB partitions.
-        2. Clear all sampled response keys: full cleanup of {uid}_{resp_idx} keys from TQ and RB.
-        """
-        # Phase 1: Deduplicate by uid from tags to get uid-level keys
-        uid_keys: set[str] = set()
-        for key, tag in zip(batch.keys, batch.tags, strict=False):
-            uid = tag.get("uid", "") if isinstance(tag, dict) else ""
-            if uid and uid not in uid_keys:
-                uid_keys.add(uid)
-
-        tq.kv_clear(keys=list(uid_keys), partition_id=batch.partition_id)
-        await self.replay_buffer.remove.remote(batch.partition_id, list(uid_keys))
-
-        # Phase 2: Clear all sampled response keys (full cleanup)
-        tq.kv_clear(keys=batch.keys, partition_id=batch.partition_id)
-        await self.replay_buffer.remove.remote(batch.partition_id, batch.keys)
 
     async def reset_staleness(self):
         """Reset version window after parameter update."""
