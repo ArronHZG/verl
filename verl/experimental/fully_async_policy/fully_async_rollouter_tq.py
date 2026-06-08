@@ -77,19 +77,19 @@ class FullyAsyncAgentLoopManagerTQ(FullyAsyncAgentLoopManager):
         worker = self._select_best_worker()
         return await worker.generate_sequences.remote(prompts, wait=True)
 
-    def generate_sequences(self, prompts):
+    async def generate_sequences(self, prompts):
         """
-        Dispatch input batch to agent loop workers without blocking. Workers should put agent loop outputs
-        into TransferQueue once an agent loop finished.
+        Dispatch input batch to agent loop workers with sync wait. Workers put agent loop outputs
+        into TransferQueue once an agent loop finished, and this method returns only after
+        all workers have completed their work.
 
         Args:
             prompts (TensorDict): Input batch from train or validation dataset.
         """
-        # mark prompts as pending in replay buffer
         chunkes = prompts.chunk(len(self.agent_loop_workers))
-        return ray.get(
-            [
-                worker.generate_sequences.remote(chunk)
+        return await asyncio.gather(
+            *[
+                worker.generate_sequences.remote(chunk, wait=True)
                 for worker, chunk in zip(self.agent_loop_workers, chunkes, strict=False)
             ]
         )
@@ -298,7 +298,7 @@ class FullyAsyncRollouterTQ(FullyAsyncRollouter):
             batch = tu.get_tensordict(batch_dict)
             tu.assign_non_tensor_data(batch, "global_steps", self.global_steps)
             tu.assign_non_tensor_data(batch, "validate", True)
-            self.async_rollout_manager.generate_sequences(batch)
+            await self.async_rollout_manager.generate_sequences(batch)
 
             # 2. sample batch from replay buffer
             sampled = await self.replay_buffer.sample.remote(partition_id="val", sample_size=len(batch))
